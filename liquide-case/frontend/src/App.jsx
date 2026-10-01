@@ -1,169 +1,312 @@
-// =============================================================================
-// Liquide Case — Frontend (React + Vite)
-//
-// Duas telas:
-//   1. LISTAGEM  — EAN, título, categoria e preço médio (máx. 20 por página)
-//   2. DETALHE   — todas as lojas/ofertas + botão "Aprimorar com IA"
-// Mais: busca no backend (filtra toda a base), exportação Excel e layout
-// responsivo.
-//
-// O frontend NÃO fala com a API externa diretamente — tudo passa pelo
-// nosso backend FastAPI (localhost:8000), como pede o case.
-// =============================================================================
 
 import { useEffect, useState } from "react";
 import "./App.css";
 
 const API = "http://localhost:8000";
+const PER_PAGE = 20;
 
-// Formata número como moeda BR (ex.: 2411.01 -> "R$ 2.411,01")
-const brl = (v) =>
-  v == null ? "—" : v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+// Converte preços numéricos ou strings para moeda brasileira.
+const brl = (value) => {
+  if (value == null || value === "") return "—";
+
+  let number = value;
+
+  if (typeof number === "string") {
+    number = number.trim().replace(/[R$\s]/g, "");
+
+    // Trata formatos como 1.234,56 e 1234.56
+    if (number.includes(",")) {
+      number = number.replace(/\./g, "").replace(",", ".");
+    }
+  }
+
+  number = Number(number);
+
+  return Number.isFinite(number)
+    ? number.toLocaleString("pt-BR", {
+        style: "currency",
+        currency: "BRL",
+      })
+    : "—";
+};
+
+// Retorna o primeiro campo preenchido disponível.
+const getField = (obj, fields, fallback = "") => {
+  for (const field of fields) {
+    const value = obj?.[field];
+    if (value !== null && value !== undefined && value !== "") {
+      return value;
+    }
+  }
+  return fallback;
+};
+
+// Normaliza os campos do produto para exibição.
+const normalizeProduct = (product) => ({
+  ...product,
+  id: getField(product, ["id", "product_id", "_id"]),
+  title: getField(
+    product,
+    ["title", "titulo", "name", "product_name", "nome"],
+    "Produto sem título"
+  ),
+  ean: getField(product, ["ean", "EAN", "gtin", "barcode"], "—"),
+  category: getField(
+    product,
+    ["category", "categoria"],
+    "Sem categoria"
+  ),
+  avg_price: getField(
+    product,
+    ["avg_price", "average_price", "preco_medio", "preco_médio"],
+    null
+  ),
+});
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+
+  if (!response.ok) {
+    throw new Error(`Erro HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
 
 function App() {
-  // ---- estado da listagem -------------------------------------------------
+  // Listagem
   const [products, setProducts] = useState([]);
   const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(0); // 20 itens por página -> offset = page * 20
+  const [page, setPage] = useState(0);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  // ---- estado do detalhe (null = tela de listagem) ------------------------
+  // Detalhes
   const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
-  // ---- estado da IA --------------------------------------------------------
-  const [ai, setAi] = useState(null); // { loading | titulo/descricao | reason }
+  // IA
+  const [ai, setAi] = useState(null);
 
-  const PER_PAGE = 20; // regra do case: no máximo 20 produtos ao mesmo tempo
-
-  // Busca a listagem quando página OU busca mudam (debounce de 300ms
-  // para não disparar uma requisição por tecla digitada).
+  // Busca produtos com debounce e cancela requisições antigas.
   useEffect(() => {
-    if (detail) return; // não recarrega a listagem enquanto o detalhe está aberto
-    const timer = setTimeout(() => {
+    if (detail) return;
+
+    const controller = new AbortController();
+
+    const timer = setTimeout(async () => {
       setLoading(true);
       setError("");
-      // A BUSCA vai para o BACKEND: filtra TODA a base, não só esta página.
-      // O total devolvido já vem filtrado, então a paginação se adapta.
-      fetch(
-        `${API}/api/products?limit=${PER_PAGE}&offset=${page * PER_PAGE}` +
-          `&search=${encodeURIComponent(search)}`
-      )
-        .then((r) => {
-          if (!r.ok) throw new Error("Backend indisponível");
-          return r.json();
-        })
-        .then((data) => {
-          setProducts(data.items);
-          setTotal(data.total);
-        })
-        .catch(() =>
+
+      try {
+        const params = new URLSearchParams({
+          limit: String(PER_PAGE),
+          offset: String(page * PER_PAGE),
+          search: search.trim(),
+        });
+
+        const data = await fetchJson(
+          `${API}/api/products?${params.toString()}`,
+          { signal: controller.signal }
+        );
+
+        const items = Array.isArray(data.items)
+          ? data.items
+          : [];
+
+        setProducts(items.map(normalizeProduct));
+        setTotal(Number(data.total) || 0);
+      } catch (err) {
+        if (err.name !== "AbortError") {
           setError(
-            "Não foi possível carregar os produtos. Verifique se o backend está rodando em localhost:8000."
-          )
-        )
-        .finally(() => setLoading(false));
+            "Não foi possível carregar os produtos. Verifique se o backend está ativo."
+          );
+          setProducts([]);
+          setTotal(0);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
     }, 300);
-    return () => clearTimeout(timer); // cancela se o usuário digitar de novo
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [page, detail, search]);
 
-  // Nova busca: reseta para a primeira página NO MOMENTO do input.
-  // (Antes isso era um useEffect separado, o que causava dupla requisição:
-  // uma com a página antiga e outra com a nova. Assim dispara só uma.)
   const onSearchChange = (e) => {
     setSearch(e.target.value);
     setPage(0);
   };
 
-  // Abre o detalhe de um produto
-  const openDetail = (id) => {
+  // Abre o detalhe e trata erros da API.
+  const openDetail = async (id) => {
+    if (!id) {
+      setError("Identificador do produto não encontrado.");
+      return;
+    }
+
     setAi(null);
-    setLoading(true);
-    fetch(`${API}/api/products/${id}`)
-      .then((r) => r.json())
-      .then((data) => setDetail(data))
-      .catch(() => setError("Erro ao carregar o produto."))
-      .finally(() => setLoading(false));
+    setError("");
+    setDetailLoading(true);
+
+    try {
+      const data = await fetchJson(
+        `${API}/api/products/${encodeURIComponent(id)}`
+      );
+      setDetail(data);
+    } catch {
+      setError("Erro ao carregar os detalhes do produto.");
+    } finally {
+      setDetailLoading(false);
+    }
   };
 
-  // "Aprimorar com IA": chama o backend; se falhar, só a área da IA é afetada
-  // (o restante da tela continua 100% funcional — requisito de resiliência)
-  const askAi = () => {
+  const askAi = async () => {
+    if (!detail?.id) return;
+
     setAi({ loading: true });
-    fetch(`${API}/api/products/${detail.id}/ai-suggest`)
-      .then((r) => r.json())
-      .then((data) =>
-        data.ai_available
-          ? setAi({ titulo: data.titulo, descricao: data.descricao })
-          : setAi({ reason: data.reason })
-      )
-      .catch(() => setAi({ reason: "IA indisponível no momento" }));
+
+    try {
+      const data = await fetchJson(
+        `${API}/api/products/${encodeURIComponent(detail.id)}/ai-suggest`
+      );
+
+      if (data.ai_available) {
+        setAi({
+          titulo: data.titulo,
+          descricao: data.descricao,
+        });
+      } else {
+        setAi({
+          reason: data.reason || "Sugestão de IA indisponível.",
+        });
+      }
+    } catch {
+      setAi({ reason: "IA indisponível no momento." });
+    }
   };
 
-  // Exportação: baixa o Excel com TODOS os produtos (rota do backend)
   const exportXlsx = () => {
-    window.open(`${API}/api/export.xlsx`, "_blank");
+    window.open(`${API}/api/export.xlsx`, "_blank", "noopener,noreferrer");
   };
 
   const totalPages = Math.ceil(total / PER_PAGE);
 
-  // ==========================================================================
-  // TELA 2 — DETALHE DO PRODUTO
-  // ==========================================================================
+  const goBack = () => {
+    setDetail(null);
+    setAi(null);
+    setError("");
+  };
+
+  // Tela de detalhes
   if (detail) {
+    const product = normalizeProduct(detail);
+    const offers = Array.isArray(detail.offers)
+      ? detail.offers
+      : [];
+
     return (
-      <div className="container">
-        <button className="back" onClick={() => setDetail(null)}>
-          ← Voltar para a listagem
+      <main className="container">
+        <button className="back" onClick={goBack}>
+          <span aria-hidden="true">←</span> Voltar para a listagem
         </button>
 
         <header className="detail-header">
-          <h1>{detail.title}</h1>
+          <span className="eyebrow">DETALHES DO PRODUTO</span>
+          <h1>{product.title}</h1>
           <p className="meta">
-            EAN {detail.ean} · {detail.category}
+            EAN: {product.ean} <span>·</span> {product.category}
           </p>
-          <p className="desc">{detail.description}</p>
+          {detail.description && (
+            <p className="desc">{detail.description}</p>
+          )}
+
           <div className="stats">
-            <span>
-              Preço médio: <strong>{brl(detail.avg_price)}</strong>
-            </span>
-            <span>
-              Mediana: <strong>{brl(detail.median)}</strong>
-            </span>
-            <span>
-              Ofertas válidas: <strong>{detail.valid_offers_count}</strong>
-            </span>
+            <div className="stat">
+              <span>Preço médio</span>
+              <strong>{brl(getField(detail, [
+                "avg_price", "average_price", "preco_medio"
+              ], null))}</strong>
+            </div>
+            <div className="stat">
+              <span>Mediana</span>
+              <strong>{brl(detail.median)}</strong>
+            </div>
+            <div className="stat">
+              <span>Ofertas válidas</span>
+              <strong>{detail.valid_offers_count ?? 0}</strong>
+            </div>
           </div>
         </header>
 
-        <h2>Ofertas por loja</h2>
-        <div className="offers">
-          {/* guarda contra ofertas undefined (defesa contra resposta inesperada) */}
-          {(detail.offers || []).map((o, i) => (
-            <div className={`offer ${o.in_average ? "" : "flagged"}`} key={i}>
-              <div className="offer-store">{o.store}</div>
-              <div className="offer-price">{o.price_display}</div>
-              <div className="offer-stock">Estoque: {o.stock_display}</div>
-              {/* selos de dados inconsistentes — transparência para o usuário */}
-              {o.price_flag && <span className="badge warn">{o.price_flag}</span>}
-              {o.stock_flag && <span className="badge">{o.stock_flag}</span>}
-              {!o.in_average && !o.price_flag && (
-                <span className="badge">fora da média</span>
-              )}
+        <section className="section">
+          <div className="section-heading">
+            <div>
+              <span className="eyebrow">COMPARAÇÃO</span>
+              <h2>Ofertas por loja</h2>
             </div>
-          ))}
-        </div>
+            <span className="offer-count">
+              {offers.length} {offers.length === 1 ? "oferta" : "ofertas"}
+            </span>
+          </div>
 
-        {/* ---- IA: área SEPARADA das informações originais (regra do case) -- */}
+          {offers.length > 0 ? (
+            <div className="offers">
+              {offers.map((offer, i) => (
+                <article
+                  className={`offer ${offer.in_average === false ? "flagged" : ""}`}
+                  key={offer.id ?? `${offer.store}-${i}`}
+                >
+                  <div className="offer-top">
+                    <span className="offer-store">
+                      {offer.store || "Loja não identificada"}
+                    </span>
+                    {offer.in_average === false && (
+                      <span className="badge">Fora da média</span>
+                    )}
+                  </div>
+                  <div className="offer-price">
+                    {offer.price_display ?? brl(offer.price)}
+                  </div>
+                  <div className="offer-stock">
+                    Estoque: {offer.stock_display ?? offer.stock ?? "—"}
+                  </div>
+                  {offer.price_flag && (
+                    <span className="badge warn">{offer.price_flag}</span>
+                  )}
+                  {offer.stock_flag && (
+                    <span className="badge">{offer.stock_flag}</span>
+                  )}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="empty">Nenhuma oferta disponível para este produto.</p>
+          )}
+        </section>
+
         <section className="ai-box">
-          <h2>Aprimorar com IA</h2>
-          <p className="ai-hint">
-            Sugestão gerada por modelo de linguagem — os dados originais acima
-            não são alterados.
-          </p>
-          <button onClick={askAi} disabled={ai?.loading}>
-            {ai?.loading ? "Gerando..." : "✨ Aprimorar com IA"}
+          <div className="ai-heading">
+            <div className="ai-icon">✦</div>
+            <div>
+              <h2>Aprimorar com IA</h2>
+              <p className="ai-hint">
+                Gere sugestões de título e descrição sem alterar os dados originais.
+              </p>
+            </div>
+          </div>
+
+          <button
+            className="ai-button"
+            onClick={askAi}
+            disabled={ai?.loading}
+          >
+            {ai?.loading ? "Gerando sugestões..." : "✦ Aprimorar com IA"}
           </button>
 
           {ai?.titulo && (
@@ -171,74 +314,153 @@ function App() {
               <h3>Título sugerido</h3>
               <p>{ai.titulo}</p>
               <h3>Descrição sugerida</h3>
-              <p>{ai.descricao}</p>
+              <p>{ai.descricao || "Sem descrição sugerida."}</p>
             </div>
           )}
-          {ai?.reason && <p className="ai-error">⚠️ {ai.reason}</p>}
+
+          {ai?.reason && <p className="ai-error">⚠ {ai.reason}</p>}
         </section>
-      </div>
+      </main>
     );
   }
 
-  // ==========================================================================
-  // TELA 1 — LISTAGEM
-  // ==========================================================================
+  // Tela de listagem
   return (
-    <div className="container">
+    <main className="container">
       <header className="list-header">
-        <h1>Consulta de Produtos e Ofertas</h1>
+        <div className="brand">
+          <div className="brand-mark">L</div>
+          <span>liquide<span className="brand-dot">.</span></span>
+        </div>
+
+        <div className="page-intro">
+          <span className="eyebrow">CATÁLOGO</span>
+          <h1>Consulta de Produtos e Ofertas</h1>
+          <p>Encontre produtos e compare preços de diferentes lojas.</p>
+        </div>
+
         <div className="toolbar">
-          <input
-            type="search"
-            placeholder="Buscar por título, EAN ou categoria..."
-            value={search}
-            onChange={onSearchChange}
-          />
-          {/* ↓ tipográfico: renderiza em qualquer fonte (emoji ↓⬇ dependem do sistema) */}
-          <button onClick={exportXlsx}>↓ Exportar Excel (todos)</button>
+          <div className="search-wrap">
+            <span className="search-icon" aria-hidden="true">⌕</span>
+            <input
+              type="search"
+              placeholder="Buscar por título, EAN ou categoria..."
+              value={search}
+              onChange={onSearchChange}
+              aria-label="Buscar produtos"
+            />
+            {search && (
+              <button
+                className="clear-search"
+                onClick={() => onSearchChange({ target: { value: "" } })}
+                aria-label="Limpar busca"
+              >
+                ×
+              </button>
+            )}
+          </div>
+          <button className="export-button" onClick={exportXlsx}>
+            <span aria-hidden="true">↓</span> Exportar Excel
+          </button>
         </div>
       </header>
 
-      {error && <p className="error">{error}</p>}
-      {loading && <p className="loading">Carregando...</p>}
+      {error && <p className="error" role="alert">{error}</p>}
+
+      {detailLoading && <p className="loading">Carregando detalhes...</p>}
+
+      {loading && <p className="loading">Carregando produtos...</p>}
 
       {!loading && !error && (
         <>
-          <div className="grid">
-            {/* sem filtro client-side: a busca já veio filtrada do backend */}
-            {products.map((p) => (
-              <button className="card" key={p.id} onClick={() => openDetail(p.id)}>
-                <span className="card-cat">{p.category}</span>
-                <h3>{p.title}</h3>
-                <p className="card-ean">EAN {p.ean}</p>
-                <p className="card-price">
-                  {p.avg_price == null ? "Sem preço válido" : brl(p.avg_price)}
-                  <small> preço médio</small>
-                </p>
-              </button>
-            ))}
+          <div className="results-heading">
+            <span>
+              {search ? "Resultados da busca" : "Produtos disponíveis"}
+            </span>
+            <span className="results-total">
+              {total} {total === 1 ? "produto" : "produtos"}
+            </span>
           </div>
 
-          {products.length === 0 && (
-            <p className="loading">Nenhum produto encontrado para "{search}".</p>
+          {products.length > 0 ? (
+            <div className="grid">
+              {products.map((p, index) => (
+                <button
+                  className="card"
+                  key={p.id ?? `${p.ean}-${index}`}
+                  onClick={() => openDetail(p.id)}
+                  disabled={!p.id}
+                >
+                  <div className="card-top">
+                    <span className="card-cat">{p.category}</span>
+                    <span className="card-arrow" aria-hidden="true">↗</span>
+                  </div>
+                  <h3>{p.title}</h3>
+                  <p className="card-ean">EAN {p.ean}</p>
+                  <div className="card-footer">
+                    <div>
+                      <span className="price-label">Preço médio</span>
+                      <p className="card-price">
+                        {p.avg_price == null
+                          ? "Sem preço válido"
+                          : brl(p.avg_price)}
+                      </p>
+                    </div>
+                    <span className="view-detail">Ver detalhes</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="empty-state">
+              <div className="empty-icon">⌕</div>
+              <h2>Nenhum produto encontrado</h2>
+              <p>
+                {search
+                  ? `Não encontramos resultados para "${search}".`
+                  : "Ainda não existem produtos cadastrados."}
+              </p>
+              {search && (
+                <button className="back" onClick={() => setSearch("")}>
+                  Limpar busca
+                </button>
+              )}
+            </div>
           )}
 
-          {/* paginação: setas para 1ª/última e anterior/próxima */}
-            <div className="pager-btns">
-              <button disabled={page === 0} onClick={() => setPage(0)}>« Primeira</button>
-              <button disabled={page === 0} onClick={() => setPage(page - 1)}>‹ Anterior</button>
+          {totalPages > 1 && (
+            <nav className="pager" aria-label="Paginação">
+              <button
+                disabled={page === 0}
+                onClick={() => setPage(0)}
+                aria-label="Primeira página"
+              >«</button>
+              <button
+                disabled={page === 0}
+                onClick={() => setPage((current) => current - 1)}
+              >‹ Anterior</button>
               <span>
-                Página {page + 1} de {totalPages || 1} · {total} produto{total === 1 ? "" : "s"}
+                Página <strong>{page + 1}</strong> de {totalPages}
               </span>
-              <button disabled={page + 1 >= totalPages} onClick={() => setPage(page + 1)}>Próxima ›</button>
+              <button
+                disabled={page + 1 >= totalPages}
+                onClick={() => setPage((current) => current + 1)}
+              >Próxima ›</button>
               <button
                 disabled={page + 1 >= totalPages}
                 onClick={() => setPage(totalPages - 1)}
-              >Última »</button>
-          </div>
+                aria-label="Última página"
+              >»</button>
+            </nav>
+          )}
         </>
       )}
-    </div>
+
+      <footer className="app-footer">
+        <span>Liquide · Consulta de produtos</span>
+        <span>Dados fornecidos pelo catálogo</span>
+      </footer>
+    </main>
   );
 }
 
