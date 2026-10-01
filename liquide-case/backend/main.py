@@ -12,7 +12,7 @@
 # DECISÃO DE DESIGN: manter um único arquivo com funções de domínio bem
 # separadas (parse_price, summarize_offers) — para um projeto deste porte,
 # isso é mais legível do que hierarquia de pastas. A próxima refatoração
-# natural, se o projeto crescesse, seria extrair "services/pricing.py" (o
+# natural, se o projeto crescesse ou eu tivesse mais seguro do tempo , seria extrair "services/pricing.py" (o
 # saneamento) e "services/groq.py" (IA) — a separação já existe nas funções.
 # =============================================================================
 
@@ -262,18 +262,31 @@ def product_summary(p: dict) -> dict:
 # -----------------------------------------------------------------------------
 
 @app.get("/api/products")
-async def list_products(limit: int = 20, offset: int = 0):
+async def list_products(limit: int = 20, offset: int = 0, search: str = ""):
     """
-    Listagem com paginação: no máximo 20 produtos por resposta (regra do
-    case: "mostrar no máximo 20 ao mesmo tempo, sem impedir o acesso aos
-    demais"). O teto de 20 é aplicado no SERVIDOR, não só na interface —
-    a regra vale mesmo que alguém chame a API com limit=1000.
+    Listagem paginada (máx. 20) com BUSCA no backend.
+
+    Por quê buscar aqui e não no frontend? Assim o filtro roda sobre TODA
+    a base (50 produtos, ou milhões num cenário real) — buscar só na página
+    visível esconderia resultados que estão em outras páginas. O total
+    devolvido reflete o filtro, então a paginação acompanha a busca.
     """
     products = await get_products()
-    limit = min(limit, 20)
+
+    # Busca por título, EAN ou categoria — insensível a maiúsculas
+    q = search.strip().lower()
+    if q:
+        products = [
+            p for p in products
+            if q in (p.get("title") or "").lower()
+            or q in str(p.get("ean") or "")
+            or q in (p.get("category") or "").lower()
+        ]
+
+    total = len(products)  # total JÁ filtrado: a paginação se adapta à busca
+    limit = min(limit, 20)  # teto de 20 por requisição (regra do case)
     items = [product_summary(p) for p in products[offset : offset + limit]]
-    # 'total' permite que o frontend saiba quantas páginas renderizar
-    return {"total": len(products), "limit": limit, "offset": offset, "items": items}
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
 
 
 @app.get("/api/products/{product_id}")
